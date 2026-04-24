@@ -1,0 +1,12 @@
+# Environment variables — never push secrets to GitHub
+.env
+
+# Virtual environment — too large to push, Render installs from requirements.txt
+.venv/
+
+# Python cache files — generated automatically, not needed in repo
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
