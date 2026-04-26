@@ -1,45 +1,74 @@
 # main.py — DocuScribe Backend
-# FastAPI application + MCP server in one file
+# FastAPI application + MCP server — by Fumnanya
+# Version 2 — file-based session store for Render stability
 
 import os
 import uuid
+import json
+import io
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── Web framework imports ──────────────────────────────────────────
+# ── Web framework ──────────────────────────────────────────────────
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ── Document processing imports ────────────────────────────────────
-# pdfplumber extracts text from PDF files
+# ── Document processing ────────────────────────────────────────────
 import pdfplumber
-# python-docx extracts text from Word documents
 from docx import Document
-import io
 
-# ── MCP (Model Context Protocol) imports ──────────────────────────
-# These come from the official Anthropic MCP Python SDK
+# ── MCP server ─────────────────────────────────────────────────────
 from mcp.server.fastmcp import FastMCP
 
-# ── Anthropic SDK import ───────────────────────────────────────────
+# ── Anthropic SDK ──────────────────────────────────────────────────
 import anthropic
 
-# ── In-memory session store ────────────────────────────────────────
-# A Python dictionary that holds extracted document text
-# Key = session ID, Value = extracted text string
-# This resets every time the server restarts (V1 only)
-document_store = {}
 
-# ── Create the FastAPI app ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# SESSION STORE — FILE BASED
+# Writes to /tmp/ on Render's disk so documents survive
+# brief server restarts within a session
+# ══════════════════════════════════════════════════════════════════
+
+SESSIONS_FILE = "/tmp/docuscribe_sessions.json"
+
+
+def load_sessions() -> dict:
+    """Load all sessions from disk. Returns empty dict if none exist."""
+    if os.path.exists(SESSIONS_FILE):
+        with open(SESSIONS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_sessions(sessions: dict):
+    """Save all sessions to disk."""
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(sessions, f)
+
+
+def get_document_text(session_id: str) -> str:
+    """Retrieve document text for a given session ID."""
+    sessions = load_sessions()
+    return sessions.get(session_id, "")
+
+
+# Tracks which session is currently active
+# Used by MCP tool functions to know which document to access
+current_session_id = {"id": None}
+
+
+# ══════════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ══════════════════════════════════════════════════════════════════
+
 app = FastAPI(
     title="DocuScribe API",
     description="Document intelligence backend — by Fumnanya",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# ── Configure CORS ─────────────────────────────────────────────────
-# Allows the React frontend on Vercel to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,59 +77,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Create the MCP server ──────────────────────────────────────────
-# FastMCP is the high-level MCP server class from the SDK
-# This is the server Claude will connect to via URL
+
+# ══════════════════════════════════════════════════════════════════
+# MCP SERVER
+# Claude connects to this via URL to access document tools
+# ══════════════════════════════════════════════════════════════════
+
 mcp = FastMCP("DocuScribe MCP Server")
 
-# ── Session ID holder ──────────────────────────────────────────────
-# Tracks which document is currently active
-# In V1 only one document is active at a time
-current_session_id = {"id": None}
 
-
-# ══════════════════════════════════════════════════════════════════
-# MCP RESOURCES
-# Resources are data Claude can read — like opening a file
-# ══════════════════════════════════════════════════════════════════
+# ── MCP RESOURCE ───────────────────────────────────────────────────
 
 @mcp.resource("document://current")
 def get_current_document() -> str:
     """
-    Returns the full extracted text of the currently uploaded document.
-    Claude reads this resource when it needs the document content.
+    Returns the full extracted text of the currently active document.
+    Claude reads this when it needs the full document content.
     """
     session_id = current_session_id["id"]
-    if not session_id or session_id not in document_store:
+    if not session_id:
         return "No document currently loaded."
-    return document_store[session_id]
+    text = get_document_text(session_id)
+    if not text:
+        return "No document currently loaded."
+    return text
 
 
-# ══════════════════════════════════════════════════════════════════
-# MCP TOOLS
-# Tools are functions Claude can call to perform specific actions
-# Each tool does exactly one job
-# ══════════════════════════════════════════════════════════════════
+# ── MCP TOOLS ──────────────────────────────────────────────────────
 
 @mcp.tool()
 def get_document_metadata() -> dict:
     """
     Returns basic metadata about the uploaded document.
-    Use this to identify what type of document has been uploaded
-    and get a high-level overview before deeper analysis.
+    Use this to get a high-level overview before deeper analysis.
     """
     session_id = current_session_id["id"]
-    if not session_id or session_id not in document_store:
+    if not session_id:
         return {"error": "No document currently loaded."}
 
-    text = document_store[session_id]
+    text = get_document_text(session_id)
+    if not text:
+        return {"error": "No document currently loaded."}
+
     word_count = len(text.split())
-    # Estimate reading time — average adult reads 200 words per minute
-    reading_time_minutes = round(word_count / 200, 1)
+    reading_time = round(word_count / 200, 1)
 
     return {
         "word_count": word_count,
-        "estimated_reading_time_minutes": reading_time_minutes,
+        "estimated_reading_time_minutes": reading_time,
         "character_count": len(text),
         "preview": text[:500] + "..." if len(text) > 500 else text
     }
@@ -110,45 +134,46 @@ def get_document_metadata() -> dict:
 def get_document_summary() -> str:
     """
     Returns the full document text for Claude to summarise.
-    Use this to generate a plain-language summary of the document.
-    Claude should summarise in plain language avoiding legal jargon.
-    Always note key parties, dates, and main obligations found.
+    Claude should summarise in plain language, noting key parties,
+    dates, and main obligations. Avoid legal jargon.
     """
     session_id = current_session_id["id"]
-    if not session_id or session_id not in document_store:
+    if not session_id:
         return "No document currently loaded."
-    # Return full text — Claude does the summarisation
-    return document_store[session_id]
+
+    text = get_document_text(session_id)
+    if not text:
+        return "No document currently loaded."
+
+    return text
 
 
 @mcp.tool()
 def search_document(query: str) -> str:
     """
-    Searches the document for content relevant to the user's query.
-    Returns the most relevant sections of the document.
-    Use this when the user asks a specific question about the document.
-    Always cite which part of the document the answer comes from.
+    Searches the document for content relevant to the query.
+    Returns the most relevant sections.
+    Use this when the user asks a specific question.
+    Always cite which section the answer comes from.
     """
     session_id = current_session_id["id"]
-    if not session_id or session_id not in document_store:
+    if not session_id:
         return "No document currently loaded."
 
-    text = document_store[session_id]
-    # Split document into paragraphs for searching
-    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    text = get_document_text(session_id)
+    if not text:
+        return "No document currently loaded."
 
-    # Find paragraphs containing query terms
+    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
     query_terms = query.lower().split()
     relevant = []
 
     for i, paragraph in enumerate(paragraphs):
         paragraph_lower = paragraph.lower()
-        # Score each paragraph by how many query terms it contains
         score = sum(1 for term in query_terms if term in paragraph_lower)
         if score > 0:
             relevant.append((score, i, paragraph))
 
-    # Sort by relevance score, return top 5 most relevant sections
     relevant.sort(reverse=True)
     top_sections = relevant[:5]
 
@@ -165,18 +190,17 @@ def search_document(query: str) -> str:
 @mcp.tool()
 def extract_structured_output() -> dict:
     """
-    Extracts key structured information from the document.
-    Returns parties involved, key obligations, dates, and risk flags.
-    Use this to generate the one-page structured summary for the user.
+    Returns the document text with instructions for structured extraction.
+    Claude should extract parties, obligations, key dates, and risk flags.
     """
     session_id = current_session_id["id"]
-    if not session_id or session_id not in document_store:
+    if not session_id:
         return {"error": "No document currently loaded."}
 
-    text = document_store[session_id]
+    text = get_document_text(session_id)
+    if not text:
+        return {"error": "No document currently loaded."}
 
-    # Return the full text — Claude extracts the structured data
-    # Claude is the reasoning layer, not this function
     return {
         "document_text": text,
         "instruction": (
@@ -189,44 +213,34 @@ def extract_structured_output() -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════
-# MCP PROMPT
-# Reusable prompt template that enforces consistent Claude behaviour
-# ══════════════════════════════════════════════════════════════════
+# ── MCP PROMPT ─────────────────────────────────────────────────────
 
 @mcp.prompt()
 def legal_summary_prompt() -> str:
-    """
-    Standard prompt for legal document analysis.
-    Enforces plain language, citation behaviour, and consistent output.
-    """
+    """Standard prompt enforcing plain language and citation behaviour."""
     return """
     You are DocuScribe, a document intelligence assistant built by Fumnanya.
-    
-    Your job is to help non-lawyer professionals understand legal and 
-    contractual documents clearly and quickly.
-    
-    Always follow these rules:
-    1. Use plain language — no legal jargon unless you immediately explain it
+    Help non-lawyer professionals understand legal and contractual documents.
+
+    Rules:
+    1. Use plain language — explain any legal terms you must use
     2. Always cite the specific section or clause your answer comes from
-    3. Flag anything that appears unusual, risky, or requires legal advice
-    4. Be direct and specific — the user needs to act on your answer
+    3. Flag anything unusual, risky, or requiring legal advice
+    4. Be direct and specific
     5. Never invent information not found in the document
     """
 
 
 # ══════════════════════════════════════════════════════════════════
 # FASTAPI ROUTES
-# HTTP endpoints the React frontend calls
 # ══════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def health_check():
-    """Health check — confirms the backend is running."""
     return {
         "status": "ok",
         "app": "DocuScribe API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "by": "Fumnanya"
     }
 
@@ -234,18 +248,14 @@ def health_check():
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     """
-    Receives an uploaded PDF or DOCX file from the frontend.
-    Extracts the text, stores it in the session store.
-    Returns a session ID the frontend uses for subsequent requests.
+    Receives a PDF or DOCX file.
+    Extracts text and saves to disk-based session store.
+    Returns session ID for subsequent requests.
     """
-    # Read the uploaded file into memory
     contents = await file.read()
-
-    # Extract text based on file type
     extracted_text = ""
 
     if file.filename.endswith(".pdf"):
-        # Use pdfplumber to extract text from PDF
         with pdfplumber.open(io.BytesIO(contents)) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
@@ -253,7 +263,6 @@ async def upload_document(file: UploadFile = File(...)):
                     extracted_text += page_text + "\n"
 
     elif file.filename.endswith(".docx"):
-        # Use python-docx to extract text from Word document
         doc = Document(io.BytesIO(contents))
         for paragraph in doc.paragraphs:
             extracted_text += paragraph.text + "\n"
@@ -264,8 +273,6 @@ async def upload_document(file: UploadFile = File(...)):
             detail="Unsupported file type. Please upload a PDF or DOCX file."
         )
 
-    # Check if extraction returned anything
-    # This catches scanned PDFs that contain no readable text
     if len(extracted_text.strip()) < 100:
         raise HTTPException(
             status_code=422,
@@ -276,13 +283,13 @@ async def upload_document(file: UploadFile = File(...)):
             )
         )
 
-    # Generate a unique session ID for this upload
+    # Generate session ID and save to disk
     session_id = str(uuid.uuid4())
+    sessions = load_sessions()
+    sessions[session_id] = extracted_text
+    save_sessions(sessions)
 
-    # Store the extracted text
-    document_store[session_id] = extracted_text
-
-    # Set this as the current active document
+    # Set as current active session
     current_session_id["id"] = session_id
 
     return {
@@ -293,7 +300,6 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 class QuestionRequest(BaseModel):
-    """Structure of a question request from the frontend."""
     question: str
     session_id: str
 
@@ -301,59 +307,56 @@ class QuestionRequest(BaseModel):
 @app.post("/ask")
 async def ask_question(request: QuestionRequest):
     """
-    Receives a question from the frontend.
+    Receives a question and session ID.
     Calls MCP tool functions directly to retrieve document content.
-    Passes retrieved content to Claude for reasoning.
-    Claude remains the reasoning layer — tools handle data access.
+    Passes structured tool output to Claude for reasoning.
+    Claude is the reasoning layer — tools handle data access.
     """
-    # Confirm the session exists
-    if request.session_id not in document_store:
+    # Confirm session exists on disk
+    sessions = load_sessions()
+    if request.session_id not in sessions:
         raise HTTPException(
             status_code=404,
             detail="Session not found. Please upload a document first."
         )
 
-    # Set the active session
+    # Set active session for MCP tool functions
     current_session_id["id"] = request.session_id
 
-    # Call MCP tool functions directly to retrieve what Claude needs
-    # This is equivalent to Claude calling these tools via remote URL
-    # V2 will use full remote MCP server communication
+    # Call MCP tool functions directly to get structured context
     metadata = get_document_metadata()
     relevant_sections = search_document(request.question)
 
-    # Build the context Claude will reason over
-    # Claude receives structured tool output, not raw document text
+    # Build structured context for Claude
     tool_context = f"""
 DOCUMENT METADATA:
-{metadata}
+Word count: {metadata.get('word_count', 'unknown')}
+Estimated reading time: {metadata.get('estimated_reading_time_minutes', 'unknown')} minutes
+Preview: {metadata.get('preview', '')}
 
 RELEVANT SECTIONS FOR THIS QUESTION:
 {relevant_sections}
 """
 
-    # Initialise the Anthropic client
+    # Call Claude with structured MCP tool output
     client = anthropic.Anthropic(
         api_key=os.getenv("ANTHROPIC_API_KEY"),
         timeout=60.0
     )
 
-    # Call Claude with the tool output as context
-    # Claude reasons over structured MCP tool output
     response = client.messages.create(
         model="claude-haiku-4-5",
         max_tokens=1500,
         system="""You are DocuScribe, a document intelligence assistant built by Fumnanya.
-
 You have been given structured output from document analysis tools.
-Use this information to answer the user's question clearly.
+Use this to answer the user's question clearly.
 
-Always follow these rules:
-1. Use plain language — no legal jargon unless you immediately explain it
+Rules:
+1. Plain language only — explain any legal terms
 2. Cite the specific section your answer comes from
-3. Flag anything unusual, risky, or requiring legal advice
-4. Be direct and specific — the user needs to act on your answer
-5. Never invent information not found in the provided sections""",
+3. Flag anything unusual or requiring legal advice
+4. Be direct — the user needs to act on your answer
+5. Never invent information not in the provided sections""",
         messages=[
             {
                 "role": "user",
@@ -363,12 +366,11 @@ Always follow these rules:
 
 User question: {request.question}
 
-Please answer the question based on the document sections provided above."""
+Answer based on the document sections above."""
             }
         ]
     )
 
-    # Extract Claude's response
     answer = ""
     for block in response.content:
         if hasattr(block, "text"):
@@ -380,7 +382,5 @@ Please answer the question based on the document sections provided above."""
     }
 
 
-# ── Mount the MCP server onto FastAPI ─────────────────────────────
-# This creates the /mcp endpoint Claude connects to
-# Without this line the MCP server has no URL
+# ── Mount MCP server ───────────────────────────────────────────────
 app.mount("/mcp", mcp.streamable_http_app())
