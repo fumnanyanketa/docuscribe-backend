@@ -317,6 +317,7 @@ async def ask_question(request: QuestionRequest):
 
     # Initialise the Anthropic client
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    timeout=60.0
 
     # Call Claude with the MCP server URL
     # This is where Claude connects to your MCP server
