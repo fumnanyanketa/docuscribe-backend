@@ -302,8 +302,9 @@ class QuestionRequest(BaseModel):
 async def ask_question(request: QuestionRequest):
     """
     Receives a question from the frontend.
-    Sets the active session, calls Claude with the MCP server.
-    Returns Claude's plain-language answer.
+    Calls MCP tool functions directly to retrieve document content.
+    Passes retrieved content to Claude for reasoning.
+    Claude remains the reasoning layer — tools handle data access.
     """
     # Confirm the session exists
     if request.session_id not in document_store:
@@ -312,39 +313,62 @@ async def ask_question(request: QuestionRequest):
             detail="Session not found. Please upload a document first."
         )
 
-    # Set the active session so MCP tools access the right document
+    # Set the active session
     current_session_id["id"] = request.session_id
 
-    # Initialise the Anthropic client
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    timeout=60.0
+    # Call MCP tool functions directly to retrieve what Claude needs
+    # This is equivalent to Claude calling these tools via remote URL
+    # V2 will use full remote MCP server communication
+    metadata = get_document_metadata()
+    relevant_sections = search_document(request.question)
 
-    # Call Claude with the MCP server URL
-    # This is where Claude connects to your MCP server
-    response = client.beta.messages.create(
-        model="claude-sonnet-4-5",
+    # Build the context Claude will reason over
+    # Claude receives structured tool output, not raw document text
+    tool_context = f"""
+DOCUMENT METADATA:
+{metadata}
+
+RELEVANT SECTIONS FOR THIS QUESTION:
+{relevant_sections}
+"""
+
+    # Initialise the Anthropic client
+    client = anthropic.Anthropic(
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        timeout=60.0
+    )
+
+    # Call Claude with the tool output as context
+    # Claude reasons over structured MCP tool output
+    response = client.messages.create(
+        model="claude-haiku-4-5",
         max_tokens=1500,
+        system="""You are DocuScribe, a document intelligence assistant built by Fumnanya.
+
+You have been given structured output from document analysis tools.
+Use this information to answer the user's question clearly.
+
+Always follow these rules:
+1. Use plain language — no legal jargon unless you immediately explain it
+2. Cite the specific section your answer comes from
+3. Flag anything unusual, risky, or requiring legal advice
+4. Be direct and specific — the user needs to act on your answer
+5. Never invent information not found in the provided sections""",
         messages=[
             {
                 "role": "user",
-                "content": request.question
+                "content": f"""Document analysis tool output:
+
+{tool_context}
+
+User question: {request.question}
+
+Please answer the question based on the document sections provided above."""
             }
-        ],
-        system="""You are DocuScribe, a document intelligence assistant built by Fumnanya.
-        Use the available MCP tools to access and analyse the uploaded document.
-        Always cite specific sections when answering questions.
-        Use plain language that a non-lawyer can understand.""",
-        mcp_servers=[
-    {
-        "type": "url",
-        "url": os.getenv("MCP_SERVER_URL", "https://docuscribe-backend.onrender.com/mcp"),
-        "name": "docuscribe"
-    }
-],
-        betas=["mcp-client-2025-04-04"]
+        ]
     )
 
-    # Extract the text response from Claude
+    # Extract Claude's response
     answer = ""
     for block in response.content:
         if hasattr(block, "text"):
